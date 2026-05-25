@@ -427,9 +427,11 @@ class SpeechBubble(QWidget):
 CRAB_W, CRAB_H            = 220, 220
 BUBBLE_W                  = 230
 BUBBLE_H_DEFAULT          = 75
-BUBBLE_H_MAX              = 140
-BUBBLE_CRAB_GAP           = 90
-CRAB_SURFACE_W            = max(CRAB_W, BUBBLE_W)
+STATS_W                   = 250
+STATS_H                   = 160
+BUBBLE_H_MAX              = max(BUBBLE_H_DEFAULT, STATS_H)
+BUBBLE_CRAB_GAP           = 140
+CRAB_SURFACE_W            = max(CRAB_W, BUBBLE_W, STATS_W)
 CRAB_SURFACE_H            = BUBBLE_H_MAX + BUBBLE_CRAB_GAP + CRAB_H
 
 
@@ -471,7 +473,12 @@ class CrabOverlay(QWidget):
         )
 
         self.bubble = SpeechBubble(self)
-        self.bubble.setGeometry(0, BUBBLE_H_MAX - BUBBLE_H_DEFAULT, BUBBLE_W, BUBBLE_H_DEFAULT)
+        self.bubble.setGeometry(
+            (CRAB_SURFACE_W - BUBBLE_W) // 2,
+            BUBBLE_H_MAX - BUBBLE_H_DEFAULT,
+            BUBBLE_W,
+            BUBBLE_H_DEFAULT,
+        )
         self.bubble.hide()
 
         screen = QApplication.primaryScreen().geometry()
@@ -486,9 +493,11 @@ class CrabOverlay(QWidget):
         self.set_state("idle")
         self.show()
 
-    def _resize_bubble(self, height: int):
+    def _resize_bubble(self, height: int, width: int = BUBBLE_W):
         h = min(height, BUBBLE_H_MAX)
-        self.bubble.setGeometry(0, BUBBLE_H_MAX - h, BUBBLE_W, h)
+        w = min(width, CRAB_SURFACE_W)
+        x = (CRAB_SURFACE_W - w) // 2
+        self.bubble.setGeometry(x, BUBBLE_H_MAX - h, w, h)
 
     def set_state(self, name: str):
         if name not in self.movies:
@@ -563,7 +572,7 @@ class CrabOverlay(QWidget):
         if chosen == quit_action:
             QApplication.quit()
         elif chosen == stats_action:
-            self._resize_bubble(130)
+            self._resize_bubble(STATS_H, STATS_W)
             self._last_quip_time = time.time()  # bypass cooldown for manual action
             self.bubble.show_quip(self.stats.summary(), duration=QUIP_STATS_DURATION)
         elif chosen and chosen.data():
