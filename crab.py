@@ -26,6 +26,10 @@ KEYBOARD_DEVICE  = "/dev/input/event2"
 SPEED_FAST       = 5.0
 SPEED_SLOW       = 1.0
 
+QUIP_COOLDOWN       = 8.0    # seconds: minimum gap between two visible bubbles
+QUIP_DURATION_MS    = 5000   # default: how long a quip bubble stays on screen
+QUIP_STATS_DURATION = 6500   # how long the stats bubble stays on screen
+
 IMAGES = {
     "idle":          SCRIPT_DIR / "idle.gif",
     "typing":        SCRIPT_DIR / "typing.gif",
@@ -242,26 +246,22 @@ class StderrMonitor:
 
 
 # --- Speech Bubble ---
+# NOTE: This is a CHILD widget of CrabOverlay, not a top-level window.
+# On Wayland, clients can't query their own global screen coordinates, so
+# making the bubble its own top-level surface meant we could never reliably
+# place it above the crab on multi-monitor setups. Sharing one surface with
+# the crab makes "which monitor" the compositor's problem -- always correct.
 class SpeechBubble(QWidget):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent):
+        super().__init__(parent)
         self._text = ""
-        self.setWindowFlags(
-            Qt.FramelessWindowHint |
-            Qt.WindowStaysOnTopHint |
-            Qt.Tool |
-            Qt.WindowDoesNotAcceptFocus
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setFixedSize(230, 75)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.hide)
 
-    def show_quip(self, text, anchor_pos, duration=3500):
+    def show_quip(self, text, duration=QUIP_DURATION_MS):
         self._text = text
-        self.move(anchor_pos.x() - 20, anchor_pos.y() - 85)
         self.show()
         self.raise_()
         self.update()
@@ -272,8 +272,9 @@ class SpeechBubble(QWidget):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(4, 4, -4, -4)
         path = QPainterPath()
-        path.addRoundedRect(4, 4, 222, 58, 14, 14)
+        path.addRoundedRect(rect, 14, 14)
         painter.fillPath(path, QColor(255, 255, 255, 235))
         painter.setPen(QPen(QColor(60, 60, 60), 1.5))
         painter.drawPath(path)
@@ -281,25 +282,43 @@ class SpeechBubble(QWidget):
         font = QFont("monospace", 9)
         font.setBold(True)
         painter.setFont(font)
-        painter.drawText(12, 8, 206, 50,
+        painter.drawText(rect.adjusted(8, 4, -8, -4),
             Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
             self._text)
 
 
 # --- Main Overlay ---
-class CrabOverlay(QLabel):
+# Layout inside the single top-level surface:
+#
+#   +-- container (CRAB_SURFACE_W x CRAB_SURFACE_H) -------+
+#   |  bubble  (BUBBLE_W x BUBBLE_H_MAX) at (x_b, 0)       |
+#   |                                                       |
+#   |  crab    (CRAB_W   x CRAB_H)       at (x_c, y_c)      |
+#   +-------------------------------------------------------+
+#
+# Because both children live on the SAME Wayland surface, the bubble is
+# always on the same monitor as the crab. No mapToGlobal() needed.
+CRAB_W, CRAB_H            = 220, 220
+BUBBLE_W                  = 230
+BUBBLE_H_DEFAULT          = 75
+BUBBLE_H_MAX              = 140
+BUBBLE_CRAB_GAP           = 22
+CRAB_SURFACE_W            = max(CRAB_W, BUBBLE_W)
+CRAB_SURFACE_H            = BUBBLE_H_MAX + BUBBLE_CRAB_GAP + CRAB_H
+
+
+class CrabOverlay(QWidget):
     def __init__(self, state: CrabState, stats: CrabStats):
         super().__init__()
-        self.state       = state
-        self.stats       = stats
-        self.movies      = {}
-        self._drag_start  = None
-        self._drag_origin = None
+        self.state  = state
+        self.stats  = stats
+        self.movies = {}
+        self._last_quip_time = 0.0
 
         for name, path in IMAGES.items():
             if path.exists():
                 movie = QMovie(str(path))
-                movie.setScaledSize(QSize(220, 220))
+                movie.setScaledSize(QSize(CRAB_W, CRAB_H))
                 self.movies[name] = movie
             else:
                 print(f"[crabdev] WARNING: Missing {path}")
@@ -313,12 +332,27 @@ class CrabOverlay(QLabel):
             Qt.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(220, 220)
+        self.setFixedSize(CRAB_SURFACE_W, CRAB_SURFACE_H)
+
+        self._crab_label = QLabel(self)
+        self._crab_label.setAttribute(Qt.WA_TranslucentBackground)
+        self._crab_label.setStyleSheet("background: transparent;")
+        self._crab_label.setGeometry(
+            (CRAB_SURFACE_W - CRAB_W) // 2,
+            BUBBLE_H_MAX + BUBBLE_CRAB_GAP,
+            CRAB_W,
+            CRAB_H,
+        )
+
+        self.bubble = SpeechBubble(self)
+        self.bubble.setGeometry(0, BUBBLE_H_MAX - BUBBLE_H_DEFAULT, BUBBLE_W, BUBBLE_H_DEFAULT)
+        self.bubble.hide()
 
         screen = QApplication.primaryScreen().geometry()
-        self.move(screen.width() - 240, screen.height() - 260)
-
-        self.bubble = SpeechBubble()
+        self.move(
+            screen.width()  - CRAB_SURFACE_W - 20,
+            screen.height() - CRAB_SURFACE_H - 40,
+        )
 
         signals.state_changed.connect(self.on_state_changed)
         signals.quip_triggered.connect(self.on_quip)
@@ -326,10 +360,14 @@ class CrabOverlay(QLabel):
         self.set_state("idle")
         self.show()
 
+    def _resize_bubble(self, height: int):
+        h = min(height, BUBBLE_H_MAX)
+        self.bubble.setGeometry(0, BUBBLE_H_MAX - h, BUBBLE_W, h)
+
     def set_state(self, name: str):
         if name not in self.movies:
             name = list(self.movies.keys())[0]
-        self.setMovie(self.movies[name])
+        self._crab_label.setMovie(self.movies[name])
         self.movies[name].start()
 
     def on_state_changed(self, name: str):
@@ -338,8 +376,17 @@ class CrabOverlay(QLabel):
         self.set_state(name)
 
     def on_quip(self, text: str):
-        if self.state.current in NON_TYPING_STATES:
-            self.bubble.show_quip(text, self.pos())
+        if self.state.current not in NON_TYPING_STATES:
+            return
+        # Cooldown: don't show another bubble until QUIP_COOLDOWN seconds
+        # have passed since the last one started. Prevents the "quip every
+        # 2 seconds" feel when the user types in short bursts.
+        now = time.time()
+        if now - self._last_quip_time < QUIP_COOLDOWN:
+            return
+        self._last_quip_time = now
+        self._resize_bubble(BUBBLE_H_DEFAULT)
+        self.bubble.show_quip(text)
 
     # --- Drag (manual delta, works on Wayland) ---
     def mousePressEvent(self, event):
@@ -390,8 +437,9 @@ class CrabOverlay(QLabel):
         if chosen == quit_action:
             QApplication.quit()
         elif chosen == stats_action:
-            self.bubble.setFixedSize(230, 130)
-            self.bubble.show_quip(self.stats.summary(), self.pos(), duration=6000)
+            self._resize_bubble(130)
+            self._last_quip_time = time.time()  # bypass cooldown for manual action
+            self.bubble.show_quip(self.stats.summary(), duration=QUIP_STATS_DURATION)
         elif chosen and chosen.data():
             self.set_state(chosen.data())
 
