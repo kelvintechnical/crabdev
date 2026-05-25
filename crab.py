@@ -9,6 +9,8 @@ import sys
 import random
 import threading
 import time
+import json
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
@@ -17,18 +19,22 @@ from PySide6.QtCore import Qt, Signal, QObject, QSize, QTimer, QPoint
 from PySide6.QtGui import QMovie, QFont, QPainter, QColor, QPen, QPainterPath
 
 # --- Config ---
-SCRIPT_DIR       = Path(__file__).parent
-WATCHING_TIMEOUT = 2.0
-WAITING_TIMEOUT  = 10.0
-AFK_TIMEOUT      = 60.0
-PANIC_DURATION   = 4.0
-KEYBOARD_DEVICE  = "/dev/input/event2"
-SPEED_FAST       = 5.0
-SPEED_SLOW       = 1.0
+SCRIPT_DIR           = Path(__file__).parent
+WATCHING_TIMEOUT     = 2.0
+WAITING_TIMEOUT      = 10.0
+SESSION_IDLE_TIMEOUT = 60.0
+AFK_TIMEOUT          = max(0.0, SESSION_IDLE_TIMEOUT - WATCHING_TIMEOUT - WAITING_TIMEOUT)
+PANIC_DURATION       = 4.0
+KEYBOARD_DEVICE      = "/dev/input/event2"
+SPEED_FAST           = 5.0
+SPEED_SLOW           = 1.0
 
 QUIP_COOLDOWN       = 8.0    # seconds: minimum gap between two visible bubbles
 QUIP_DURATION_MS    = 5000   # default: how long a quip bubble stays on screen
 QUIP_STATS_DURATION = 6500   # how long the stats bubble stays on screen
+
+WEATHER_INTERVAL = 30 * 60   # seconds: refresh local weather every 30 minutes
+HTTP_TIMEOUT     = 5         # seconds: keep network lookups from hanging the app
 
 IMAGES = {
     "idle":          SCRIPT_DIR / "idle.gif",
@@ -86,7 +92,20 @@ SLOW_QUIPS = [
     "zzzz...",
 ]
 
-NON_TYPING_STATES = {"watching", "waiting", "afk", "panic", "panic_message"}
+WPM_QUIPS = [
+    "{wpm} WPM. respectable mammal behavior.",
+    "{wpm} WPM. the claws approve.",
+    "{wpm} WPM. not bad for land typing.",
+    "{wpm} WPM. I have seen worse.",
+]
+
+WEATHER_QUIPS = [
+    "{temp}F and {condition} in {city}. crab forecast: judgment.",
+    "{city}: {temp}F, {condition}. still indoors, I see.",
+    "Outside is {temp}F and {condition}. alleged fresh air exists.",
+]
+
+NON_TYPING_STATES = {"idle", "watching", "waiting", "afk", "panic", "panic_message"}
 
 
 # --- Signals ---
@@ -105,12 +124,17 @@ class CrabStats:
         self.panic_count      = 0
         self.afk_count        = 0
         self._recent_keys     = []
+        self._session_keys    = []
+        self.last_wpm         = None
+        self.best_wpm         = 0.0
+        self.last_weather     = None
 
     def record_keypress(self):
         self.total_keystrokes += 1
         now = time.time()
         self._recent_keys.append(now)
         self._recent_keys = [t for t in self._recent_keys if now - t <= 2.0]
+        self._session_keys.append(now)
 
     def check_speed_after_stop(self):
         kps = len(self._recent_keys) / 2.0
@@ -118,6 +142,27 @@ class CrabStats:
             signals.quip_triggered.emit(random.choice(FAST_QUIPS))
         elif kps <= SPEED_SLOW and self.total_keystrokes > 0:
             signals.quip_triggered.emit(random.choice(SLOW_QUIPS))
+
+    def finish_typing_session(self):
+        if len(self._session_keys) < 5:
+            self._session_keys = []
+            return None
+
+        first_key = self._session_keys[0]
+        last_key = self._session_keys[-1]
+        minutes = max((last_key - first_key) / 60.0, 1 / 60)
+        wpm = round((len(self._session_keys) / 5.0) / minutes, 1)
+        self.last_wpm = wpm
+        self.best_wpm = max(self.best_wpm, wpm)
+        self._session_keys = []
+        return wpm
+
+    def update_weather(self, city, temp, condition):
+        self.last_weather = {
+            "city": city,
+            "temp": temp,
+            "condition": condition,
+        }
 
     def record_panic(self):
         self.panic_count += 1
@@ -129,8 +174,18 @@ class CrabStats:
         elapsed = datetime.now() - self.session_start
         hours, rem = divmod(int(elapsed.total_seconds()), 3600)
         minutes, _ = divmod(rem, 60)
+        last_wpm = "--" if self.last_wpm is None else f"{self.last_wpm:.1f}"
+        weather = "Weather: --\n"
+        if self.last_weather:
+            weather = (
+                f"Weather: {self.last_weather['temp']}F, "
+                f"{self.last_weather['condition']} in "
+                f"{self.last_weather['city']}\n"
+            )
         return (
             f"Keystrokes: {self.total_keystrokes:,}\n"
+            f"WPM last/best: {last_wpm}/{self.best_wpm:.1f}\n"
+            f"{weather}"
             f"Panics: {self.panic_count}\n"
             f"AFK: {self.afk_count}x\n"
             f"Session: {hours}h {minutes}m\n"
@@ -193,10 +248,17 @@ class CrabState:
 
     def _go_afk(self):
         self.stats.record_afk()
+        became_afk = False
         with self.lock:
             if self.current == "waiting":
                 self.current = "afk"
                 signals.state_changed.emit("afk")
+                became_afk = True
+
+        if became_afk:
+            wpm = self.stats.finish_typing_session()
+            if wpm is not None:
+                signals.quip_triggered.emit(random.choice(WPM_QUIPS).format(wpm=wpm))
 
     def _panic_done(self):
         with self.lock:
@@ -228,6 +290,70 @@ def keyboard_listener(state: CrabState):
         print(f"[crabdev] Keyboard not found: {KEYBOARD_DEVICE}")
     except Exception as e:
         print(f"[crabdev] Keyboard error: {e}")
+
+
+# --- Weather ---
+def _weather_code_text(code):
+    weather_codes = {
+        0: "clear",
+        1: "mostly clear",
+        2: "partly cloudy",
+        3: "cloudy",
+        45: "foggy",
+        48: "foggy",
+        51: "drizzly",
+        53: "drizzly",
+        55: "drizzly",
+        61: "rainy",
+        63: "rainy",
+        65: "rainy",
+        71: "snowy",
+        73: "snowy",
+        75: "snowy",
+        80: "showery",
+        81: "showery",
+        82: "showery",
+        95: "stormy",
+        96: "stormy",
+        99: "stormy",
+    }
+    return weather_codes.get(code, "mysterious")
+
+
+def _read_json(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "crabdev"})
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def weather_listener(stats: CrabStats):
+    while True:
+        try:
+            location = _read_json("https://ipapi.co/json/")
+            latitude = location["latitude"]
+            longitude = location["longitude"]
+            city = location.get("city") or "your area"
+            weather = _read_json(
+                "https://api.open-meteo.com/v1/forecast"
+                f"?latitude={latitude}&longitude={longitude}"
+                "&current=temperature_2m,weather_code"
+                "&temperature_unit=fahrenheit"
+            )
+            current = weather["current"]
+            temp = round(current["temperature_2m"])
+            condition = _weather_code_text(current["weather_code"])
+            stats.update_weather(city, temp, condition)
+            signals.quip_triggered.emit(
+                random.choice(WEATHER_QUIPS).format(
+                    city=city,
+                    temp=temp,
+                    condition=condition,
+                )
+            )
+        except Exception as e:
+            print(f"[crabdev] Weather error: {e}")
+
+        time.sleep(WEATHER_INTERVAL)
 
 
 # --- Stderr Monitor ---
@@ -302,7 +428,7 @@ CRAB_W, CRAB_H            = 220, 220
 BUBBLE_W                  = 230
 BUBBLE_H_DEFAULT          = 75
 BUBBLE_H_MAX              = 140
-BUBBLE_CRAB_GAP           = 22
+BUBBLE_CRAB_GAP           = 90
 CRAB_SURFACE_W            = max(CRAB_W, BUBBLE_W)
 CRAB_SURFACE_H            = BUBBLE_H_MAX + BUBBLE_CRAB_GAP + CRAB_H
 
@@ -458,8 +584,12 @@ def main():
 
     overlay = CrabOverlay(state, stats)
 
+    weather_thread = threading.Thread(target=weather_listener, args=(stats,), daemon=True)
+    weather_thread.start()
+
     print("[crabdev] 🦀 Crab is on duty.")
-    print("[crabdev] idle -> typing -> watching(2s) -> waiting(10s) -> afk(60s)")
+    print("[crabdev] idle -> typing -> watching(2s) -> waiting(10s) -> afk(60s total idle)")
+    print("[crabdev] WPM reported after 60s idle; weather refreshes every 30m.")
     print("[crabdev] Bubble never interrupts typing.")
     print("[crabdev] Right-click for stats, previews, quit.")
 
